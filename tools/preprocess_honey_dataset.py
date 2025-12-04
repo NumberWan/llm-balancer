@@ -17,132 +17,26 @@ os.environ["TRANSFORMERS_CACHE"] = SAFE_CACHE_DIR
 os.environ["TMPDIR"] = SAFE_CACHE_DIR
 os.environ["TEMP"] = SAFE_CACHE_DIR
 os.environ["TMP"] = SAFE_CACHE_DIR
-# =================================================
 
-# =================================================
-# 全局變量說明
-# =================================================
-# 以下函數依賴於在 if __name__ == '__main__' 中定義的全局變量：
-# 
-# - task_type: 任務類型 (0=回歸, 1=二分類, 2=多分類)
-# - FLAG_VICUNA_DATA_ONLY: 是否只處理單一模型數據
-# - FLAG_FIRST_ROUND_ONLY: 是否只處理第一輪對話
-# - FLAG_HEAD_TAIL: 是否使用 head-tail 截斷策略
-# - FLAG_USE_LOG_LOSS: 是否使用 log-space labels
-# - multi_cls_thresholds: 分類任務的閾值列表
-# - vicuna_tokenizer: tokenizer（用於計算 token 數量）
-# - bert_tokenizer: tokenizer（用於文本 tokenization）
-# - model_name_to_idx: 模型名稱到索引的映射字典
-# - num_models: 模型總數
-# - percentiles: 每個模型的分位數列表（用於分類任務）
-#
-# 這些變量必須在調用 preprocess_dataset 之前定義。
-# =================================================
 import datasets
 from datasets import load_dataset, Dataset, Features, Value
-import transformers
 from transformers import BlipProcessor
 from PIL import Image
-import pandas as pd
-import seaborn as sns
-import matplotlib.pyplot as plt
 import argparse
-import torch
 import glob
 import io
 import numpy as np
 import multiprocessing
-
-def exact_multi_round_prompt(dataset):
-    """
-    處理多輪對話數據集。
-    
-    全局變量依賴：
-    - vicuna_tokenizer: tokenizer 用於計算 token 數量
-    - task_type: 任務類型 (0=回歸, 1=二分類, 2=多分類)
-    - multi_cls_thresholds: 分類任務的閾值列表
-    - FLAG_USE_LOG_LOSS: 是否使用 log-space labels
-    """
-    df = dataset.to_pandas()
-    ans_df = pd.DataFrame(columns=['prompt', 'labels', 'num_tokens', 'conversation_id', 'turn_id', 'images'])
-
-    n_illegal_samples = 0
-    for conversation_id in range(len(df)):
-        if conversation_id % 10000 == 0:
-            print('Processing conversation ' + str(conversation_id))
-        sample = df.iloc[conversation_id]
-        conversations = sample['conversations']
-        images_data = sample.get('images', [])
-        dialogue_so_far = ''
-
-        new_samples = {'prompt': [], 
-                       'labels': [], 
-                       'num_tokens': [], 
-                       'conversation_id': [], 
-                       'turn_id': [],
-                       'images': []}
-
-        turn_id = 0
-        for i, sentence in enumerate(conversations):
-            if sentence.get('from') == 'human' or sentence.get('role') == 'user':
-                dialogue_so_far += '[USER]: ' + sentence.get('value', sentence.get('content', '')) + '\n'
-            elif sentence.get('from') == 'gpt' or sentence.get('role') == 'assistant':
-                assistant_content = sentence.get('value', sentence.get('content', ''))
-
-                encoded_response = vicuna_tokenizer(assistant_content, truncation=False)
-                num_tokens = len(encoded_response['input_ids'])
-                
-                # Drop abnormal samples that have empty responses or might have been truncated.
-                if num_tokens <= 1 or num_tokens >= 512:
-                    n_illegal_samples += 1
-                    break
-
-                # Add a new prediction sample
-                new_samples['prompt'].append(dialogue_so_far)
-                new_samples['conversation_id'].append(conversation_id)
-                new_samples['images'].append(images_data)  # 保留圖像數據
-                new_samples['turn_id'].append(turn_id)
-                new_samples['num_tokens'].append(num_tokens)
-                
-                if task_type == 0:
-                    # 回歸任務：根據 FLAG_USE_LOG_LOSS 決定是否對標籤取 log
-                    if FLAG_USE_LOG_LOSS:
-                        import math
-                        new_samples['labels'].append(math.log(num_tokens + 1.0))
-                    else:
-                        new_samples['labels'].append(num_tokens)
-                else:
-                    # 分類任務：使用閾值分類
-                    # 確保所有樣本都會被分配標籤（最後一個閾值應該是一個很大的數）
-                    label_assigned = False
-                    for j, thresh in enumerate(multi_cls_thresholds):
-                        if num_tokens < thresh:
-                            new_samples['labels'].append(j)
-                            label_assigned = True
-                            break
-                    # 如果沒有被分配標籤（理論上不應該發生，因為最後一個閾值很大），分配最後一個類別
-                    if not label_assigned:
-                        new_samples['labels'].append(len(multi_cls_thresholds) - 1)
-                dialogue_so_far += '[ASSISTANT]: ' + assistant_content + '\n'
-                turn_id += 1
-
-        new_samples = pd.DataFrame(new_samples)
-        ans_df = pd.concat([ans_df, new_samples], ignore_index=True)
-
-    ans_dataset = Dataset.from_pandas(ans_df)
-    print('Number of illegal samples: ', n_illegal_samples)
-    return ans_dataset
+import math
 
 
 def extract_first_round_prompt(example):
     """
     提取第一輪對話的用戶提示和助手回應。
+    使用 log-space labels (log(tokens + 1)) 用於回歸任務。
     
     全局變量依賴：
-    - vicuna_tokenizer: tokenizer 用於計算 token 數量
-    - task_type: 任務類型 (0=回歸, 1=二分類, 2=多分類)
-    - multi_cls_thresholds: 分類任務的閾值列表
-    - FLAG_USE_LOG_LOSS: 是否使用 log-space labels
+    - blip_tokenizer: tokenizer（blip_processor.tokenizer）用於計算 token 數量
     """
     conversations = example['conversations']
     user_content = ''
@@ -161,7 +55,6 @@ def extract_first_round_prompt(example):
     # 如果對話以助手消息開始（沒有用戶消息），跳過這個樣本
     if i == 0:
         example['prompt'] = ''
-        example['num_tokens'] = 0
         example['labels'] = 0
         return example
     
@@ -176,29 +69,11 @@ def extract_first_round_prompt(example):
             break
 
     example['prompt'] = user_content
-    encoded_response = vicuna_tokenizer(assistant_content, truncation=False)
+    encoded_response = blip_tokenizer(assistant_content, truncation=False)
     num_tokens = len(encoded_response['input_ids'])
-    example['num_tokens'] = num_tokens
     
-    if task_type == 0:
-        # 回歸任務：根據 FLAG_USE_LOG_LOSS 決定是否對標籤取 log
-        if FLAG_USE_LOG_LOSS:
-            import math
-            example['labels'] = math.log(num_tokens + 1.0)  # log(tokens + 1)
-        else:
-            example['labels'] = num_tokens
-    else:
-        # 分類任務：使用閾值分類
-        # 確保所有樣本都會被分配標籤（最後一個閾值應該是一個很大的數）
-        label_assigned = False
-        for i, thresh in enumerate(multi_cls_thresholds):
-            if num_tokens < thresh:
-                example['labels'] = i
-                label_assigned = True
-                break
-        # 如果沒有被分配標籤（理論上不應該發生，因為最後一個閾值很大），分配最後一個類別
-        if not label_assigned:
-            example['labels'] = len(multi_cls_thresholds) - 1
+    # 回歸任務：使用 log-space labels (log(tokens + 1))
+    example['labels'] = math.log(num_tokens + 1.0)
     
     return example
 
@@ -264,13 +139,13 @@ def process_images(example):
 def tokenize_function(example):
     """
     對文本進行 tokenization。
+    如果用戶輸入超過 512 個 token，標記為無效樣本（將被過濾）。
     
     全局變量依賴：
-    - bert_tokenizer: tokenizer（實際上是 blip_processor.tokenizer）
-    - FLAG_HEAD_TAIL: 是否使用 head-tail 截斷策略
+    - blip_tokenizer: tokenizer（blip_processor.tokenizer）
     """
-    # 使用 bert_tokenizer (實際上是 blip_processor.tokenizer) 進行 tokenization
-    encoded = bert_tokenizer(example["prompt"], truncation=False)
+    # 使用 blip_tokenizer (blip_processor.tokenizer) 進行 tokenization
+    encoded = blip_tokenizer(example["prompt"], truncation=False)
     
     # 獲取 input_ids 和 attention_mask (這些通常都有)
     input_ids = encoded['input_ids']
@@ -279,21 +154,17 @@ def tokenize_function(example):
     # 安全獲取 token_type_ids (如果沒有則設為 None)
     token_type_ids = encoded.get('token_type_ids', None)
     
-    if len(input_ids) >= 512:
-        if FLAG_HEAD_TAIL:
-            # Head-Tail 截斷策略
-            example['input_ids'] = input_ids[:128] + input_ids[-384:]
-            example['attention_mask'] = attention_mask[:128] + attention_mask[-384:]
-            if token_type_ids is not None:
-                example['token_type_ids'] = token_type_ids[:128] + token_type_ids[-384:]
-        else:
-            # 僅保留尾部策略 (Tail only)
-            example['input_ids'] = input_ids[-512:]
-            example['attention_mask'] = attention_mask[-512:]
-            if token_type_ids is not None:
-                example['token_type_ids'] = token_type_ids[-512:]
+    # 如果長度超過 512，標記為無效樣本
+    if len(input_ids) > 512:
+        example['is_valid'] = False
+        # 仍然賦值（雖然會被過濾），避免錯誤
+        example['input_ids'] = input_ids[:512]
+        example['attention_mask'] = attention_mask[:512]
+        if token_type_ids is not None:
+            example['token_type_ids'] = token_type_ids[:512]
     else:
         # 如果沒有超過長度，直接賦值
+        example['is_valid'] = True
         example['input_ids'] = input_ids
         example['attention_mask'] = attention_mask
         if token_type_ids is not None:
@@ -302,92 +173,12 @@ def tokenize_function(example):
     return example
 
 
-def replace_model_name_by_idx(example):
-    """
-    將模型名稱替換為索引，並進行 one-hot 編碼（如果是回歸任務）。
-    
-    全局變量依賴：
-    - model_name_to_idx: 模型名稱到索引的映射字典
-    - num_models: 模型總數
-    - task_type: 任務類型 (0=回歸, 1=二分類, 2=多分類)
-    """
-    example['model'] = model_name_to_idx[example['model']]
-    if task_type == 0:
-        # update the model idx with one hot encoding
-        # only for task_type == 0 because in other task types, the model idx will be one-hot coded
-        # in the recalc_labels_and_one_hot_model_name function
-        arr = [0 for _ in range(num_models)]
-        arr[example['model']] = 1
-        example['model'] = arr
-    return example
-
-
-def recalc_labels_and_one_hot_model_name(example):
-    """
-    根據分位數重新計算標籤，並進行模型名稱的 one-hot 編碼。
-    
-    全局變量依賴：
-    - percentiles: 每個模型的分位數列表
-    - num_models: 模型總數
-    """
-    for i, thresh in enumerate(percentiles[example['model']]):
-        if example['num_tokens'] < thresh:
-            example['labels'] = i
-            break
-    arr = [0 for _ in range(num_models)]
-    arr[example['model']] = 1
-    example['model'] = arr
-    return example
-
-
-def calc_percentile(dataset):
-    """
-    計算數據集的分位數，並根據分位數重新計算標籤。
-    
-    全局變量依賴：
-    - FLAG_VICUNA_DATA_ONLY: 是否只處理單一模型數據
-    - num_models: 模型總數
-    - percentiles: 每個模型的分位數列表（會被修改）
-    """
-    if FLAG_VICUNA_DATA_ONLY:
-        output_token_lengths = []
-        for sample in dataset:
-            output_token_lengths.append(sample['num_tokens'])
-        s = pd.Series(output_token_lengths)
-        print(s.describe(percentiles=[.25, .5, .75, .99]))
-        # s = s[s < 2048]
-        # sns.histplot(s,
-        #          kde=False, 
-        #          bins=100, color = 'blue')
-        # plt.xlabel('Output Token Length')
-        # plt.ylabel('User Requests')
-        # plt.savefig('dist.png')
-    else:
-        output_token_lengths = [[] for _ in range(num_models)]
-        for sample in dataset:
-            output_token_lengths[sample['model']].append(sample['num_tokens'])
-        for model_id in range(num_models):
-            s = pd.Series(output_token_lengths[model_id])
-            desc = s.describe(percentiles=[.25, .5, .75, .99])
-            percentiles[model_id].extend([desc['25%'], desc['50%'], desc['75%'], desc['99%'], 1000000])
-        # print(percentiles)
-        dataset = dataset.map(recalc_labels_and_one_hot_model_name)
-    return dataset
-
-
 def preprocess_dataset(dataset, original_dataset=None, use_cache=True):
     """
     預處理數據集：提取對話、處理圖像、tokenization 等。
     
     全局變量依賴：
-    - FLAG_VICUNA_DATA_ONLY: 是否只處理單一模型數據
-    - FLAG_FIRST_ROUND_ONLY: 是否只處理第一輪對話
-    - task_type: 任務類型 (0=回歸, 1=二分類, 2=多分類)
-    - vicuna_tokenizer: tokenizer（用於 extract_first_round_prompt 和 exact_multi_round_prompt）
-    - bert_tokenizer: tokenizer（用於 tokenize_function）
-    - model_name_to_idx: 模型名稱到索引的映射（用於 replace_model_name_by_idx）
-    - num_models: 模型總數（用於 replace_model_name_by_idx 和 calc_percentile）
-    - percentiles: 每個模型的分位數列表（用於 calc_percentile）
+    - blip_tokenizer: tokenizer（blip_processor.tokenizer，用於 extract_first_round_prompt 和 tokenize_function）
     """
     # 移除 Honey-Data-1M 中不需要的欄位（保留 id, conversations, images）
     columns_to_remove = ['source', 'img_phash', 'img_size']
@@ -396,47 +187,37 @@ def preprocess_dataset(dataset, original_dataset=None, use_cache=True):
     if columns_to_remove:
         dataset = dataset.remove_columns(columns_to_remove)
     
+    # 添加 prompt 和 labels 欄位
     new_sentence_column = [''] * len(dataset)
     dataset = dataset.add_column('prompt', new_sentence_column)
     new_label_column = [0] * len(dataset)
     dataset = dataset.add_column('labels', new_label_column)
-    if task_type != 0:
-        new_length_column = [0] * len(dataset)
-        dataset = dataset.add_column('num_tokens', new_length_column)
 
-    # Extract the user prompt(s) and the corresponding response length
-    if FLAG_FIRST_ROUND_ONLY:
-        # 先提取 prompt 和 labels，同時移除 conversations 欄位
-        # 注意：這裡我們暫時保留 images 欄位，但會在 filter 之前移除它以避免觸發圖像解碼
-        dataset = dataset.map(extract_first_round_prompt, remove_columns=['conversations'])
-        
-        # 在 filter 之前，保存包含 images 的數據集副本（用於後續圖像處理）
-        # 然後移除 images 欄位以避免 filter 時觸發圖像解碼（這會導致性能問題和可能的錯誤）
-        has_images = 'images' in dataset.column_names
-        if has_images:
-            # 保存包含 images 的數據集副本（如果沒有提供原始數據集）
-            if original_dataset is None:
-                # 只保存必要的欄位以節省內存（id 和 images）
-                if 'id' in dataset.column_names:
-                    original_dataset = dataset.select_columns(['id', 'images'])
-                else:
-                    # 如果沒有 id，創建一個臨時索引映射
-                    original_dataset = dataset.select_columns(['images'])
-                    # 添加臨時索引欄位
-                    original_dataset = original_dataset.add_column('temp_idx', list(range(len(original_dataset))))
-            # 移除 images 欄位以避免 filter 時觸發圖像解碼
-            dataset = dataset.remove_columns(['images'])
-            print('Temporarily removed images column to avoid decoding during filter')
-        
-        print('Num samples before filtering: ', len(dataset))
-        if task_type == 0:
-            dataset = dataset.filter(lambda example: example["labels"] > 1 and example["labels"] < 512)
-        else:
-            dataset = dataset.filter(lambda example: example["num_tokens"] > 1 and example["num_tokens"] < 512)
-        print('Num samples after filtering: ', len(dataset))
-    else:
-        # 多輪對話處理（需要修改 exact_multi_round_prompt 來支援 Honey-Data-1M）
-        dataset = exact_multi_round_prompt(dataset)
+    # 提取第一輪對話的 prompt 和 labels
+    dataset = dataset.map(extract_first_round_prompt, remove_columns=['conversations'])
+    
+    # 在 filter 之前，保存包含 images 的數據集副本（用於後續圖像處理）
+    # 然後移除 images 欄位以避免 filter 時觸發圖像解碼（這會導致性能問題和可能的錯誤）
+    has_images = 'images' in dataset.column_names
+    if has_images:
+        # 保存包含 images 的數據集副本（如果沒有提供原始數據集）
+        if original_dataset is None:
+            # 只保存必要的欄位以節省內存（id 和 images）
+            if 'id' in dataset.column_names:
+                original_dataset = dataset.select_columns(['id', 'images'])
+            else:
+                # 如果沒有 id，創建一個臨時索引映射
+                original_dataset = dataset.select_columns(['images'])
+                # 添加臨時索引欄位
+                original_dataset = original_dataset.add_column('temp_idx', list(range(len(original_dataset))))
+        # 移除 images 欄位以避免 filter 時觸發圖像解碼
+        dataset = dataset.remove_columns(['images'])
+        print('Temporarily removed images column to avoid decoding during filter')
+    
+    # 過濾：只保留 labels 在合理範圍內的樣本（log space: log(2) 到 log(512)）
+    print('Num samples before filtering: ', len(dataset))
+    dataset = dataset.filter(lambda example: example["labels"] > math.log(2) and example["labels"] < math.log(512))
+    print('Num samples after filtering: ', len(dataset))
     
     # --- 處理圖像數據（修復 Schema 不匹配問題）---
     print('Processing images with explicit schema...')
@@ -445,12 +226,9 @@ def preprocess_dataset(dataset, original_dataset=None, use_cache=True):
     current_columns = dataset.column_names
     
     # 2. 定義我們要移除的欄位（舊的圖像數據）
-    # 確保 'images' 在移除列表中（如果存在）
     columns_to_remove = ['images'] if 'images' in current_columns else []
     
     # 3. 構建新的 Features Schema
-    # 關鍵：不能直接 copy() 舊的 features，因為舊的 features 裡可能包含 'images'
-    # 我們需要建立一個不包含 'images' 但包含新 'image' (binary) 的 Schema
     new_features = dataset.features.copy()
     
     # 如果舊 Schema 裡有 'images'，先刪除它（這是解決 Schema 不匹配的關鍵）
@@ -460,9 +238,6 @@ def preprocess_dataset(dataset, original_dataset=None, use_cache=True):
     # 添加我們新的二進制圖像欄位
     new_features['image'] = Value("binary")
     
-    # 為了安全起見，明確告訴 datasets 我們保留哪些欄位
-    # 這能防止 "Schema and number of arrays unequal" 錯誤
-    # 因為 map 返回的字典 key 必須與 new_features 的 key 一一對應
     print(f"Columns to remove: {columns_to_remove}")
     print(f"Target features: {list(new_features.keys())}")
     
@@ -473,7 +248,6 @@ def preprocess_dataset(dataset, original_dataset=None, use_cache=True):
             print('Attempting to retrieve images from original dataset...')
             
             # 建立索引映射：filter 後的數據集索引 -> 原始數據集索引
-            # 由於 filter 會改變索引，我們需要通過 id 或其他方式匹配
             if 'id' in dataset.column_names and 'id' in original_dataset.column_names:
                 # 通過 id 匹配
                 id_to_original_idx = {sample_id: idx for idx, sample_id in enumerate(original_dataset['id'])}
@@ -483,41 +257,25 @@ def preprocess_dataset(dataset, original_dataset=None, use_cache=True):
                         if 'id' in example:
                             original_idx = id_to_original_idx.get(example['id'])
                             if original_idx is not None and original_idx < len(original_dataset):
-                                # 使用 try-except 捕獲圖像解碼錯誤（損壞的圖像文件）
                                 try:
-                                    # 訪問原始數據集時可能會觸發圖像自動解碼
-                                    # 如果圖像損壞（如 broken PNG），會拋出 SyntaxError 或其他異常
                                     sample = original_dataset[original_idx]
                                     images_data = sample.get('images', [])
-                                    # 使用 process_images 的邏輯處理圖像
-                                    # process_images 內部也有異常處理，但這裡也加上以防萬一
                                     return process_images({'images': images_data})
                                 except (SyntaxError, OSError, IOError, ValueError, 
                                         TypeError, AttributeError, KeyError, IndexError) as e:
-                                    # 捕獲圖像解碼錯誤（損壞的 PNG、JPEG 等）
-                                    # SyntaxError: broken PNG file
-                                    # OSError/IOError: 文件讀取錯誤
-                                    # ValueError: 圖像格式錯誤
-                                    # 返回空圖像，不中斷處理流程
                                     return {'image': b''}
                                 except Exception as e:
-                                    # 捕獲任何其他未預期的錯誤，返回空圖像
                                     return {'image': b''}
                     except Exception as e:
-                        # 捕獲任何其他錯誤（如索引錯誤等），返回空圖像
                         return {'image': b''}
                     return {'image': b''}
             elif 'temp_idx' in original_dataset.column_names:
-                # 使用臨時索引（如果原始數據集有 temp_idx）
-                # 注意：這需要 filter 後的數據集也保留相同的索引順序
-                # 但實際上 filter 會改變順序，所以這個方法可能不適用
                 print('Warning: Cannot reliably map indices after filter, using empty images')
                 dataset = dataset.map(lambda x: {'image': b''}, features=new_features)
             else:
-                # 無法建立映射，使用空圖像
                 print('Warning: Cannot map to original dataset, using empty images')
                 dataset = dataset.map(lambda x: {'image': b''}, features=new_features)
-                original_dataset = None  # 標記為無法使用
+                original_dataset = None
             
             if original_dataset is not None:
                 num_procs = min(64, max(1, multiprocessing.cpu_count() - 2))
@@ -529,29 +287,28 @@ def preprocess_dataset(dataset, original_dataset=None, use_cache=True):
                     num_proc=num_procs,
                     features=new_features,
                     desc="Processing images from original dataset",
-                    load_from_cache_file=use_cache  # 使用緩存可以大幅加速（默認 True）
+                    load_from_cache_file=use_cache
                 )
         else:
             print('Warning: No images field found in dataset and cannot retrieve from original dataset')
             dataset = dataset.map(lambda x: {'image': b''}, features=new_features)
     else:
         # 計算適合的進程數（考慮到圖像已限制為 384x384，可以使用更多進程）
-        # 但為了避免內存問題，建議不要超過 64
         num_procs = min(64, max(1, multiprocessing.cpu_count() - 2))
         print(f"Using {num_procs} processes for image processing.")
         
         dataset = dataset.map(
             process_images,
-            batched=False,          # process_images 是一次處理單張
-            writer_batch_size=1000, # 提高寫入緩衝區大小
-            num_proc=num_procs,     # 啟用多進程加速（限制為 64 以避免內存問題）
-            remove_columns=columns_to_remove,  # 在 map 結束後移除舊欄位
-            features=new_features,  # 強制使用新的 Schema（無 'images'，有 'image'）
+            batched=False,
+            writer_batch_size=1000,
+            num_proc=num_procs,
+            remove_columns=columns_to_remove,
+            features=new_features,
             desc="Processing images",
-            load_from_cache_file=use_cache  # 使用緩存可以大幅加速（默認 True）
+            load_from_cache_file=use_cache
         )
     
-    # 統計圖片狀況（因為數據量大，使用簡單的計數方式）
+    # 統計圖片狀況
     try:
         has_image_count = sum(1 for i in range(min(1000, len(dataset))) if len(dataset[i]['image']) > 0)
         if len(dataset) > 1000:
@@ -559,9 +316,9 @@ def preprocess_dataset(dataset, original_dataset=None, use_cache=True):
         else:
             print(f'Number of samples with valid images: {has_image_count}/{len(dataset)}')
     except:
-        pass  # 統計失敗不影響處理
+        pass
     
-    # 過濾掉沒有有效圖像的樣本（在預處理階段就移除，避免訓練時出錯）
+    # 過濾掉沒有有效圖像的樣本
     print('Filtering out samples without valid images...')
     num_before_filter = len(dataset)
     
@@ -577,7 +334,6 @@ def preprocess_dataset(dataset, original_dataset=None, use_cache=True):
                 return False
             # 嘗試驗證圖像是否有效
             try:
-                import io
                 img = Image.open(io.BytesIO(image_data))
                 img.load()  # 強制加載，驗證圖像是否損壞
                 return True
@@ -586,7 +342,6 @@ def preprocess_dataset(dataset, original_dataset=None, use_cache=True):
         elif image_data is None:
             return False
         else:
-            # 其他格式（PIL Image, numpy array 等）
             return True
     
     dataset = dataset.filter(has_valid_image)
@@ -597,87 +352,48 @@ def preprocess_dataset(dataset, original_dataset=None, use_cache=True):
     if num_after_filter == 0:
         raise ValueError("No samples with valid images found after filtering! Please check your dataset.")
     
-    if FLAG_VICUNA_DATA_ONLY:
-        # Honey-Data-1M 可能沒有 model 欄位，需要處理
-        if 'model' in dataset.column_names:
-            dataset = dataset.remove_columns(['model'])
-    else:
-        # 如果資料集有 model 欄位，進行處理
-        if 'model' in dataset.column_names:
-            dataset = dataset.map(replace_model_name_by_idx)
+    # 移除 model 欄位（如果存在）
+    if 'model' in dataset.column_names:
+        dataset = dataset.remove_columns(['model'])
     
     # Tokenize the user prompt
     dataset = dataset.map(tokenize_function, batched=False, remove_columns=['prompt'])
+    
+    # 過濾掉用戶輸入超過 512 個 token 的樣本
+    print('Num samples before filtering long prompts: ', len(dataset))
+    dataset = dataset.filter(lambda example: example.get('is_valid', True))
+    print('Num samples after filtering long prompts: ', len(dataset))
+    
+    # 移除 is_valid 標記欄位
+    if 'is_valid' in dataset.column_names:
+        dataset = dataset.remove_columns(['is_valid'])
+    
     return dataset
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--all_models', action='store_true', default=False)
-    parser.add_argument('--multi_round', action='store_true', default=False)
-    parser.add_argument('--head_tail', action='store_true', default=False)
-    parser.add_argument('--task_type', type=int, help='0 for regression, 1 for binary cls, 2 for multi-cls', default=2)
+    parser = argparse.ArgumentParser(description='Preprocess Honey-Data-1M for regression with log-space labels (first round only)')
     parser.add_argument('--data_size', type=int, help='Size of the dataset to use (in thousands). Use 0 to process entire dataset', default=1000)
-    parser.add_argument('--model_name', type=str, help='Name of the LLM to predict for (not used for Honey-Data-1M)', default='vicuna-13b')
     parser.add_argument('--local_dataset_path', type=str, help='Path to local dataset folder (for offline use)', default='/data2/models/Honey-Data-1M')
-    parser.add_argument('--use_log_loss', action='store_true', help='Use log-space labels for regression', default=False)
     parser.add_argument('--blip_local_dir', type=str, help='Local path to BLIP model for offline use', default='/data2/w00917303/decode-router/blip-image-captioning-base/')
     parser.add_argument('--output_dir', type=str, help='Directory to save processed dataset', default='/tmp')
     parser.add_argument('--batch_size', type=int, help='Process dataset in batches to save memory (0 = process all at once)', default=0)
     parser.add_argument('--force_reprocess', action='store_true', help='Force reprocess all data, ignore cache (default: use cache to speed up)', default=False)
     args = parser.parse_args()
 
-    # 0: regression; 1: binary classification; 2: multi-class classification;
-    task_type = args.task_type
-    FLAG_VICUNA_DATA_ONLY = not args.all_models
-    FLAG_FIRST_ROUND_ONLY = not args.multi_round
-    FLAG_HEAD_TAIL = args.head_tail
-    FLAG_USE_LOG_LOSS = args.use_log_loss
-    # cls_threshold = 328
-    # 使用分位數作為閾值（20%, 40%, 60%, 80%）以平衡類別分布
-    # 這些值需要根據實際資料集調整，可以執行 check_dataset_distribution.py 來獲取
-    if task_type == 1:
-        multi_cls_thresholds = [141, 503, 1000000]  # Binary classification (3 classes)
-    else:
-        # 5-class balanced thresholds based on percentiles (adjust if needed)
-        # 估計值：20%≈80, 40%≈130, 60%≈170, 80%≈230
-        # 實際建議：先執行 check_dataset_distribution.py 查看你的資料分布
-        multi_cls_thresholds = [80, 130, 180, 250, 1000000] if FLAG_FIRST_ROUND_ONLY else [58, 147, 280, 499, 100000]
-    
     dataset_name = 'Open-Bee/Honey-Data-1M'
     
-    # Initialize BLIP processor and use其 tokenizer 作為文字 tokenizer（離線、本地路徑）
+    # Initialize BLIP processor and use its tokenizer as text tokenizer (offline, local path)
     print(f'Loading BLIP processor from local dir: {args.blip_local_dir} ...')
     blip_processor = BlipProcessor.from_pretrained(args.blip_local_dir, local_files_only=True)
     # BLIP 內部使用的 tokenizer（通常是 BertTokenizerFast）
-    vicuna_tokenizer = blip_processor.tokenizer
-    bert_tokenizer = blip_processor.tokenizer
+    blip_tokenizer = blip_processor.tokenizer
     
     # 如果 data_size 為 0，表示處理整個數據集（不限制大小）
     selected_data_size = 0 if args.data_size == 0 else 1000 * args.data_size
-
-    model_names = ['vicuna-13b', 'wizardlm-13b', 'palm-2', 'llama-2-13b-chat', 'koala-13b',
-                   'claude-instant-1', 'oasst-pythia-12b', 'alpaca-13b', 'mpt-7b-chat',
-                   'vicuna-7b', 'dolly-v2-12b', 'mpt-30b-chat', 'fastchat-t5-3b', 'chatglm-6b',
-                   'claude-1', 'gpt-4', 'vicuna-33b', 'guanaco-33b', 'RWKV-4-Raven-14B',
-                   'stablelm-tuned-alpha-7b', 'llama-13b', 'gpt-3.5-turbo', 'llama-2-7b-chat',
-                   'claude-2', 'gpt4all-13b-snoozy']
-    model_name_to_idx = {model_names[i]: i for i in range(len(model_names))}
-    num_models = len(model_names)
-
-    # 構建資料集路徑（Honey-Data-1M 專用）
-    dataset_path = 'honey_' if FLAG_VICUNA_DATA_ONLY else 'honey_all_'
-    dataset_path = dataset_path if task_type == 0 else dataset_path + 'cls_' if task_type == 1 else dataset_path + 'multi_cls_'
-    if FLAG_FIRST_ROUND_ONLY:
-        dataset_path = 'first_round_data_' + dataset_path
-    elif FLAG_HEAD_TAIL:
-        dataset_path = 'headtail_' + dataset_path
-    else:
-        dataset_path = 'tail_' + dataset_path
     
-    # 如果使用 log loss，在路徑名稱中標記
-    if FLAG_USE_LOG_LOSS and task_type == 0:
-        dataset_path = dataset_path + 'log_'
+    # 構建資料集路徑（固定為 first_round_data_honey_log_）
+    dataset_path = 'first_round_data_honey_log_'
     
     # 構建完整保存路徑
     if selected_data_size == 0:
@@ -734,7 +450,7 @@ if __name__ == '__main__':
         elif selected_data_size == 0:
             print(f'Processing entire dataset ({len(dataset)} samples)')
     
-    # Honey-Data-1M 沒有 model 欄位，所以不需要過濾
+    # 打亂數據集
     dataset = dataset.shuffle(seed=1)
     
     # 分批處理或一次性處理
@@ -751,7 +467,6 @@ if __name__ == '__main__':
             batch_dataset = dataset.select(range(start_idx, end_idx))
             
             # 處理當前批次
-            # use_cache: 如果 force_reprocess=True，則不使用緩存（重新計算）
             batch_dataset = preprocess_dataset(batch_dataset, use_cache=not args.force_reprocess)
             
             # 保存臨時批次
@@ -788,37 +503,27 @@ if __name__ == '__main__':
         
         # 清理臨時批次檔案
         print('Cleaning up temporary batch files...')
+        import shutil
         for temp_path in processed_datasets:
-            import shutil
             try:
                 shutil.rmtree(temp_path)
             except:
                 pass
-        
-        # 重新計算分位數（如果需要）
-        percentiles = [[] for _ in range(num_models)]
-        if task_type != 0:
-            dataset = calc_percentile(dataset)
     else:
         # 一次性處理所有資料
         print('Processing entire dataset at once...')
         try:
-            # use_cache: 如果 force_reprocess=True，則不使用緩存（重新計算）
             dataset = preprocess_dataset(dataset, use_cache=not args.force_reprocess)
-            
-            percentiles = [[] for _ in range(num_models)]
-            if task_type != 0:
-                dataset = calc_percentile(dataset)
         except Exception as e:
             print(f"Error processing dataset: {e}")
             print("Consider using --batch_size to process in smaller batches.")
             import sys
             sys.exit(1)
     
-    # 設置格式為 torch，但保留 pixel_values 為 tensor
+    # 設置格式為 torch
     dataset.set_format("torch")
 
     # 保存最終資料集
     os.makedirs(args.output_dir, exist_ok=True)
     dataset.save_to_disk(full_dataset_path)
-    print(f'Saved dataset to {full_dataset_path}')]
+    print(f'Saved dataset to {full_dataset_path}')
